@@ -1689,7 +1689,6 @@ function_return function_py_interface_await(function func, function_impl impl, f
 	Py_IncRef(py_impl->asyncio_loop);
 	Py_IncRef(coroutine);
 	Py_IncRef(py_impl->py_task_callback_handler);
-	Py_IncRef(callback_status);
 
 	PyTuple_SetItem(args_tuple, 0, py_impl->asyncio_loop);
 	PyTuple_SetItem(args_tuple, 1, coroutine);
