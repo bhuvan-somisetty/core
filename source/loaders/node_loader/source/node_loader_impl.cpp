@@ -4579,10 +4579,7 @@ napi_value node_loader_impl_promise_await(loader_impl_node node_impl, napi_env e
 		napi_throw(env, result);
 	}
 
-	/* The promise is resolved or rejected through handle_promise_safe, so the returned future is not needed anymore,
-	* destroy it now instead of in the promise finalizer, which runs at teardown when the loader is already destroyed
-	* and the future promise reference would never be deleted */
-	metacall_value_destroy(ret);
+	node_loader_impl_finalizer(env, promise, ret);
 
 	return promise;
 }
