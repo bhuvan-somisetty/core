@@ -163,8 +163,19 @@ typedef struct loader_impl_py_await_invoke_callback_state_type
 	function_reject_callback reject_callback;
 	void *context;
 	PyObject *coroutine;
+	PyObject *future; /* Future resolved with the value returned by the callbacks (only when awaiting a future) */
 
 } *loader_impl_py_await_invoke_callback_state;
+
+PyObject *py_task_callback_handler_impl(PyObject *self, PyObject *py_future);
+
+/* Wrap the C callback around a PyObject so that the interpreter knows how to call back as if it was python code */
+static PyMethodDef py_task_callback_handler_def = {
+	"metacall_task_callback_handler",
+	py_task_callback_handler_impl,
+	METH_O,
+	"MetaCall async invoke callback"
+};
 
 static int py_loader_impl_check_class(loader_impl_py py_impl, PyObject *obj);
 
@@ -317,6 +328,122 @@ int future_py_interface_create(future f, future_impl impl)
 	return 0;
 }
 
+future_return future_py_interface_await(future f, future_impl impl, future_resolve_callback resolve_callback, future_reject_callback reject_callback, void *context)
+{
+	loader_impl_py_future py_future = (loader_impl_py_future)impl;
+	loader_impl_py py_impl;
+	loader_impl_py_await_invoke_callback_state callback_state;
+	PyObject *args_tuple, *output_future, *capsule, *callback, *add_done_callback, *call_soon_threadsafe_str, *result;
+	value v;
+
+	(void)f;
+
+	if (py_future == NULL)
+	{
+		return NULL;
+	}
+
+	py_impl = py_future->py_impl;
+
+	py_loader_thread_acquire();
+
+	/* Create the future that will be resolved with the value returned by the callbacks */
+	args_tuple = PyTuple_New(1);
+
+	if (args_tuple == NULL)
+	{
+		goto error;
+	}
+
+	Py_IncRef(py_impl->asyncio_loop);
+	PyTuple_SetItem(args_tuple, 0, py_impl->asyncio_loop);
+
+	output_future = PyObject_Call(py_impl->thread_background_future_create, args_tuple, NULL);
+	Py_DecRef(args_tuple);
+
+	if (output_future == NULL)
+	{
+		goto error;
+	}
+
+	/* Use this capsule to handle the callback pointers to the python task callback */
+	callback_state = malloc(sizeof(struct loader_impl_py_await_invoke_callback_state_type));
+
+	if (callback_state == NULL)
+	{
+		goto error_output_future;
+	}
+
+	callback_state->impl = py_future->impl;
+	callback_state->func_val = NULL;
+	callback_state->resolve_callback = resolve_callback;
+	callback_state->reject_callback = reject_callback;
+	callback_state->context = context;
+	callback_state->coroutine = NULL;
+	callback_state->future = output_future;
+
+	capsule = PyCapsule_New(callback_state, NULL, NULL);
+
+	if (capsule == NULL)
+	{
+		free(callback_state);
+		goto error_output_future;
+	}
+
+	/* Asyncio futures do not allow setting attributes, so the capsule is passed as self of the callback */
+	callback = PyCFunction_NewEx(&py_task_callback_handler_def, capsule, NULL);
+	Py_DecRef(capsule);
+
+	if (callback == NULL)
+	{
+		free(callback_state);
+		goto error_output_future;
+	}
+
+	/* Asyncio futures are not thread safe, so the callback is registered from the event loop thread */
+	add_done_callback = PyObject_GetAttrString(py_future->future, "add_done_callback");
+
+	if (add_done_callback == NULL)
+	{
+		Py_DecRef(callback);
+		free(callback_state);
+		goto error_output_future;
+	}
+
+	call_soon_threadsafe_str = PyUnicode_FromString("call_soon_threadsafe");
+	result = PyObject_CallMethodObjArgs(py_impl->asyncio_loop, call_soon_threadsafe_str, add_done_callback, callback, NULL);
+	Py_DecRef(call_soon_threadsafe_str);
+	Py_DecRef(add_done_callback);
+	Py_DecRef(callback);
+
+	if (result == NULL)
+	{
+		free(callback_state);
+		goto error_output_future;
+	}
+
+	Py_DecRef(result);
+
+	/* The callback state owns the reference of output_future, the returned value holds a new one */
+	v = py_loader_impl_capi_to_value(py_future->impl, output_future, TYPE_FUTURE);
+
+	py_loader_thread_release();
+
+	return v;
+
+error_output_future:
+	Py_DecRef(output_future);
+error:
+	if (PyErr_Occurred() != NULL)
+	{
+		py_loader_impl_error_print(py_impl);
+	}
+
+	py_loader_thread_release();
+
+	return NULL;
+}
+
 void future_py_interface_destroy(future f, future_impl impl)
 {
 	loader_impl_py_future py_future = (loader_impl_py_future)impl;
@@ -338,7 +465,7 @@ future_interface future_py_singleton(void)
 {
 	static struct future_interface_type py_future_interface = {
 		&future_py_interface_create,
-		NULL,
+		&future_py_interface_await,
 		&future_py_interface_destroy
 	};
 
@@ -1548,10 +1675,17 @@ PyObject *py_task_callback_handler_impl(PyObject *self, PyObject *py_future)
 {
 	py_loader_thread_acquire();
 
-	/* self will always be NULL */
-	(void)self;
+	/* When awaiting a future, self is the capsule, when awaiting a coroutine, self is NULL and the capsule is stored in the task */
+	PyObject *capsule = self;
 
-	PyObject *capsule = PyObject_GetAttrString(py_future, "__metacall_capsule");
+	if (capsule != NULL)
+	{
+		Py_IncRef(capsule);
+	}
+	else
+	{
+		capsule = PyObject_GetAttrString(py_future, "__metacall_capsule");
+	}
 
 	if (capsule == NULL)
 	{
@@ -1617,6 +1751,7 @@ PyObject *py_task_callback_handler_impl(PyObject *self, PyObject *py_future)
 	}
 
 	loader_impl impl = callback_state->impl;
+	PyObject *output_future = callback_state->future;
 
 	Py_DecRef(callback_state->coroutine);
 
@@ -1626,23 +1761,59 @@ PyObject *py_task_callback_handler_impl(PyObject *self, PyObject *py_future)
 	value_type_destroy(callback_state->func_val);
 	free(callback_state);
 
-	if (ret == NULL)
-	{
-		return Py_ReturnNone();
-	}
-	else
+	PyObject *py_result = NULL;
+
+	if (ret != NULL)
 	{
 		py_loader_thread_acquire();
 
-		PyObject *py_result = py_loader_impl_value_to_capi(impl, value_type_id(ret), ret);
+		py_result = py_loader_impl_value_to_capi(impl, value_type_id(ret), ret);
 
 		py_loader_thread_release();
 
 		/* The value returned by the callback is owned by the loader, it has been copied into py_result */
 		value_type_destroy(ret);
-
-		return py_result;
 	}
+
+	if (output_future == NULL)
+	{
+		return py_result == NULL ? Py_ReturnNone() : py_result;
+	}
+
+	/* Resolve the future returned by the await with the value returned by the callback */
+	py_loader_thread_acquire();
+
+	loader_impl_py py_impl = loader_impl_get(impl);
+	PyObject *args_tuple = PyTuple_New(3); /* loop, future, value */
+
+	if (args_tuple != NULL)
+	{
+		Py_IncRef(py_impl->asyncio_loop);
+
+		/* The tuple steals the references of output_future and py_result */
+		PyTuple_SetItem(args_tuple, 0, py_impl->asyncio_loop);
+		PyTuple_SetItem(args_tuple, 1, output_future);
+		PyTuple_SetItem(args_tuple, 2, py_result == NULL ? Py_ReturnNone() : py_result);
+
+		PyObject *resolve_result = PyObject_Call(py_impl->thread_background_future_resolve, args_tuple, NULL);
+
+		if (resolve_result == NULL && PyErr_Occurred() != NULL)
+		{
+			py_loader_impl_error_print(py_impl);
+		}
+
+		Py_DecRef(resolve_result);
+		Py_DecRef(args_tuple);
+	}
+	else
+	{
+		Py_DecRef(output_future);
+		Py_DecRef(py_result);
+	}
+
+	py_loader_thread_release();
+
+	return Py_ReturnNone();
 }
 
 function_return function_py_interface_invoke(function func, function_impl impl, function_args args, size_t args_size)
@@ -1790,6 +1961,7 @@ function_return function_py_interface_await(function func, function_impl impl, f
 	callback_state->impl = py_func->impl;
 	callback_state->context = context;
 	callback_state->coroutine = coroutine;
+	callback_state->future = NULL;
 
 	PyObject *callback_status = PyCapsule_New(callback_state, NULL, NULL);
 
@@ -2111,14 +2283,6 @@ int py_loader_impl_initialize_asyncio_module(loader_impl_py py_impl, const int h
 		log_write("metacall", LOG_LEVEL_ERROR, "Error getting asyncio.iscoroutinefunction(func)");
 		goto error_after_asyncio_module;
 	}
-
-	/* Wrap the C callback around a PyObject so that the interpreter knows how to call back as if it was python code */
-	static PyMethodDef py_task_callback_handler_def = {
-		"metacall_task_callback_handler",
-		py_task_callback_handler_impl,
-		METH_O,
-		"MetaCall async invoke callback"
-	};
 
 	py_impl->py_task_callback_handler = PyCFunction_NewEx(&py_task_callback_handler_def, NULL, NULL);
 
